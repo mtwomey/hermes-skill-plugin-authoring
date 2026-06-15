@@ -1,0 +1,16 @@
+name: <plugin-name>
+version: 1.0.0
+description: >
+  One or two sentences describing what the plugin does and what service/system
+  it connects to. Include the account/server it targets if user-specific.
+provides_tools:
+  - <plugin>_ping
+  # List every tool name here. Must match the "name" in each schema dict.
+requires_env:
+  # These appear in the setup wizard (hermes setup). Comment out section if no creds.
+  - name: ENV_KEY1
+    description: "What this value is (e.g. API key, hostname)"
+    secret: false          # true = masked in prompts, stored as password in keychain
+  - name: ENV_KEY2
+    description: "What this value is"
+    secret: true
