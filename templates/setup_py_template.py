@@ -6,6 +6,9 @@ Usage:
     python setup.py remove  [--yes]   # Uninstall (remove symlink, disable plugin)
     python setup.py status            # Show current install/credential state
     python setup.py creds  [--yes]    # Re-enter or update stored credentials
+    python setup.py log debug         # Enable DEBUG logging (requires Hermes restart)
+    python setup.py log quiet         # Disable debug logging (back to WARNING)
+    python setup.py log status        # Show current log level setting
 
 Replace all tokens before using:
     <plugin-name>   kebab-case plugin name, e.g. "weather"
@@ -286,6 +289,64 @@ def cmd_creds(yes: bool = False):
     print()
 
 
+# ── Log level management ──────────────────────────────────────────────────────
+# Log level is stored in plugins.config.<plugin-name>.log_level in config.yaml.
+# Unlike MCP servers (which inject --log-level into subprocess args), native
+# plugins are in-process, so the level is stored under plugins.config and read
+# by __init__.py at startup via _get_log_level() + setup_logging().
+
+def cmd_log(action: str = "status"):
+    if not _is_enabled():
+        print(f"  ⚠️  Plugin '{PLUGIN_NAME}' is not enabled — run 'python setup.py install' first")
+        sys.exit(1)
+
+    data, yaml = _read_config()
+
+    def _get_level():
+        plugins = data.get("plugins") or {}
+        config  = plugins.get("config") or {}
+        plugin  = config.get(PLUGIN_NAME) or {}
+        return plugin.get("log_level")
+
+    def _set_level(level_or_none):
+        from ruamel.yaml import CommentedMap
+        if "plugins" not in data or data["plugins"] is None:
+            data["plugins"] = CommentedMap()
+        if "config" not in data["plugins"] or data["plugins"]["config"] is None:
+            data["plugins"]["config"] = CommentedMap()
+        if PLUGIN_NAME not in data["plugins"]["config"] or data["plugins"]["config"][PLUGIN_NAME] is None:
+            data["plugins"]["config"][PLUGIN_NAME] = CommentedMap()
+        if level_or_none is None:
+            if "log_level" in data["plugins"]["config"][PLUGIN_NAME]:
+                del data["plugins"]["config"][PLUGIN_NAME]["log_level"]
+        else:
+            data["plugins"]["config"][PLUGIN_NAME]["log_level"] = level_or_none
+        _write_config(data, yaml)
+
+    if action == "status":
+        level = _get_level() or "WARNING (default)"
+        print(f"\n  Log level for plugins.config.{PLUGIN_NAME}: {level}")
+        log_file = HERMES_HOME / "logs" / f"{PLUGIN_NAME}.log"
+        if log_file.exists():
+            print(f"  Log file: {log_file}  ({log_file.stat().st_size // 1024} KB)")
+        else:
+            print(f"  Log file: {log_file}  (not yet created)")
+        print()
+
+    elif action == "debug":
+        _set_level("DEBUG")
+        print(f"  ✓ Log level set to DEBUG. Restart Hermes to apply.")
+        print(f"  ➡  tail -f {HERMES_HOME}/logs/{PLUGIN_NAME}.log")
+
+    elif action == "quiet":
+        _set_level(None)
+        print(f"  ✓ Log level reset to WARNING (default). Restart Hermes to apply.")
+
+    else:
+        print(f"  Unknown log action: {action!r}. Use: debug | quiet | status")
+        sys.exit(1)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -303,6 +364,10 @@ def main():
     creds_p = sub.add_parser("creds", help="Re-enter stored credentials")
     creds_p.add_argument("--yes", "-y", action="store_true")
 
+    log_p = sub.add_parser("log", help="Manage plugin log level")
+    log_p.add_argument("log_action", nargs="?", choices=["debug", "quiet", "status"],
+                       default="status")
+
     args = parser.parse_args()
 
     if args.command == "install":
@@ -313,6 +378,8 @@ def main():
         cmd_status()
     elif args.command == "creds":
         cmd_creds(yes=args.yes)
+    elif args.command == "log":
+        cmd_log(action=args.log_action)
     else:
         parser.print_help()
 
