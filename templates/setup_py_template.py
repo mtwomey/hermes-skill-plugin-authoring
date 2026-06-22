@@ -2,13 +2,13 @@
 setup.py for the <plugin-name> Hermes plugin.
 
 Usage:
-    python setup.py install [--yes]   # Install (symlink, enable, store creds)
-    python setup.py remove  [--yes]   # Uninstall (remove symlink, disable plugin)
-    python setup.py status            # Show current install/credential state
-    python setup.py creds  [--yes]    # Re-enter or update stored credentials
-    python setup.py log debug         # Enable DEBUG logging (requires Hermes restart)
-    python setup.py log quiet         # Disable debug logging (back to WARNING)
-    python setup.py log status        # Show current log level setting
+    ./setup.sh install [--yes]   # Install (symlink, enable, store creds)
+    ./setup.sh remove  [--yes]   # Uninstall (remove symlink, disable plugin)
+    ./setup.sh status            # Show current install/credential state
+    ./setup.sh creds  [--yes]    # Re-enter or update stored credentials
+    ./setup.sh log debug         # Enable DEBUG logging (requires Hermes restart)
+    ./setup.sh log quiet         # Disable debug logging (back to WARNING)
+    ./setup.sh log status        # Show current log level setting
 
 Replace all tokens before using:
     <plugin-name>   kebab-case plugin name, e.g. "weather"
@@ -19,15 +19,11 @@ Replace all tokens before using:
 
 import argparse
 import os
-import subprocess
 import sys
 from pathlib import Path
 
-try:
-    from ruamel.yaml import YAML  # preserves comments and key order
-except ImportError:
-    sys.exit("ruamel.yaml is required. Install it in the Hermes venv:\n"
-             "  ~/.hermes/hermes-agent/venv/bin/pip install ruamel.yaml")
+from ruamel.yaml import YAML  # preserves comments and key order
+import keyring
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -43,14 +39,14 @@ REPO_DIR = Path(__file__).resolve().parent
 PLUGIN_LINK = PLUGINS_DIR / PLUGIN_NAME
 
 # Credential keys stored in keychain. Set to [] if plugin has no credentials.
-KEYS = ["key1", "key2"]   # ← replace with actual key names, or set to []
+KEYS = ["key1", "key2"]  # ← replace with actual key names, or set to []
 
 # For each key: human prompt label, optional default value, and is_secret flag.
-# is_secret=True → input is hidden in terminal and stored as "password" type in keychain.
+# is_secret=True → input is hidden in terminal and stored as a password entry.
 CRED_PROMPTS = {
     "key1": {
         "label": "Key1 label (e.g. API key, hostname)",
-        "default": "",        # leave blank for no default
+        "default": "",
         "is_secret": False,
     },
     "key2": {
@@ -60,34 +56,33 @@ CRED_PROMPTS = {
     },
 }
 
+_KEYCHAIN_CACHE: dict[str, str | None] = {}
+
 
 # ── Keychain helpers ──────────────────────────────────────────────────────────
 
-def _keychain_store(key: str, value: str, is_secret: bool = False) -> None:
+def _keychain_store(key: str, value: str) -> None:
     """Store a credential in macOS Keychain."""
-    kind = "password" if is_secret else "generic-password"
-    try:
-        # Delete old entry silently
-        subprocess.run(
-            ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", key],
-            capture_output=True, check=False
-        )
-        subprocess.run(
-            ["security", "add-generic-password",
-             "-s", KEYCHAIN_SERVICE, "-a", key, "-w", value],
-            check=True, capture_output=True,
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"  ⚠️  Failed to store {key}: {e.stderr.decode().strip()}")
+    keyring.set_password(KEYCHAIN_SERVICE, key, value)
+    _KEYCHAIN_CACHE[key] = value
 
 
 def _keychain_read(key: str) -> str | None:
     """Read a credential from macOS Keychain. Returns None if not found."""
-    result = subprocess.run(
-        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", key, "-w"],
-        capture_output=True, text=True, check=False
-    )
-    return result.stdout.strip() if result.returncode == 0 else None
+    if key in _KEYCHAIN_CACHE:
+        return _KEYCHAIN_CACHE[key]
+    val = keyring.get_password(KEYCHAIN_SERVICE, key)
+    _KEYCHAIN_CACHE[key] = val
+    return val
+
+
+def _keychain_delete(key: str) -> None:
+    """Delete a credential from macOS Keychain. Silent if not found."""
+    try:
+        keyring.delete_password(KEYCHAIN_SERVICE, key)
+    except Exception:
+        pass
+    _KEYCHAIN_CACHE.pop(key, None)
 
 
 def _prompt_cred(key: str, existing: str | None = None) -> str:
@@ -162,6 +157,11 @@ def _disable_plugin() -> None:
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
+def _finish_install():
+    print(f"\n  ✅ {PLUGIN_NAME} plugin installed.")
+    print("  ➡  Restart Hermes to activate tools.\n")
+
+
 def cmd_status():
     print(f"\n{'─'*50}")
     print(f" Status: {PLUGIN_NAME} plugin")
@@ -170,7 +170,7 @@ def cmd_status():
     link_ok = PLUGIN_LINK.is_symlink() and PLUGIN_LINK.resolve() == REPO_DIR
     enabled_ok = _is_enabled()
 
-    print(f"  Plugin symlink : {'✓' if link_ok    else '✗'} {PLUGIN_LINK}")
+    print(f"  Plugin symlink : {'✓' if link_ok else '✗'} {PLUGIN_LINK}")
     print(f"  Enabled        : {'✓' if enabled_ok else '✗'} (plugins.enabled in config.yaml)")
 
     if KEYS:
@@ -184,7 +184,7 @@ def cmd_status():
     if link_ok and enabled_ok and (not KEYS or all(cred_status().values())):
         print("  ✅ Ready — restart Hermes to activate the plugin.")
     else:
-        print("  ❌ Run: python setup.py install")
+        print("  ❌ Run: ./setup.sh install")
     print()
 
 
@@ -227,7 +227,7 @@ def cmd_install(yes: bool = False):
             existing = _keychain_read(key)
             value = _prompt_cred(key, existing)
             if value:
-                _keychain_store(key, value, is_secret=CRED_PROMPTS.get(key, {}).get("is_secret", False))
+                _keychain_store(key, value)
                 print(f"  ✓ Stored: {key}")
             elif existing:
                 print(f"  ✓ Kept existing: {key}")
@@ -235,11 +235,6 @@ def cmd_install(yes: bool = False):
                 print(f"  ⚠️  Skipped (no value): {key}")
 
     _finish_install()
-
-
-def _finish_install():
-    print(f"\n  ✅ {PLUGIN_NAME} plugin installed.")
-    print("  ➡  Restart Hermes to activate tools.\n")
 
 
 def cmd_remove(yes: bool = False):
@@ -262,10 +257,7 @@ def cmd_remove(yes: bool = False):
         ans = input("\n  Also delete stored credentials from Keychain? [y/N]: ").strip().lower()
         if ans == "y":
             for key in KEYS:
-                subprocess.run(
-                    ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", key],
-                    capture_output=True, check=False
-                )
+                _keychain_delete(key)
             print("  ✓ Credentials removed from Keychain.")
 
     print(f"\n  ✅ {PLUGIN_NAME} plugin removed. Restart Hermes to deactivate.\n")
@@ -280,7 +272,7 @@ def cmd_creds(yes: bool = False):
         existing = _keychain_read(key)
         value = _prompt_cred(key, existing)
         if value:
-            _keychain_store(key, value, is_secret=CRED_PROMPTS.get(key, {}).get("is_secret", False))
+            _keychain_store(key, value)
             print(f"  ✓ Updated: {key}")
         elif existing:
             print(f"  ✓ Kept existing: {key}")
@@ -297,7 +289,7 @@ def cmd_creds(yes: bool = False):
 
 def cmd_log(action: str = "status"):
     if not _is_enabled():
-        print(f"  ⚠️  Plugin '{PLUGIN_NAME}' is not enabled — run 'python setup.py install' first")
+        print(f"  ⚠️  Plugin '{PLUGIN_NAME}' is not enabled — run './setup.sh install' first")
         sys.exit(1)
 
     data, yaml = _read_config()
@@ -379,7 +371,7 @@ def main():
     elif args.command == "creds":
         cmd_creds(yes=args.yes)
     elif args.command == "log":
-        cmd_log(action=args.log_action)
+        cmd_log(args.log_action)
     else:
         parser.print_help()
 
