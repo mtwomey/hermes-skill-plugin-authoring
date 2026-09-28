@@ -164,6 +164,47 @@ Always use the **qualified name** (`plugin:plugin`) in meta-skills and routing t
 
 Changes to `__init__.py`, `schemas.py`, or `tools.py` require a Hermes restart. No hot reload.
 
+### Rule 7b — NEVER hardcode the Hermes venv path
+
+`hermes update` rebuilds the venv at a new content-addressed path under
+`$HERMES_HOME/installs/<id>/environments/<hash>/venv`, and the pre-package-manager
+path (`~/.hermes/hermes-agent/venv`) **survives the upgrade as a stale decoy** — it
+still exists and still has a working `python3`, so a hardcoded path fails silently
+instead of loudly. Installs land in a venv nothing imports from, and every plugin
+loses its dependencies on each upgrade.
+
+Symptom: `hermes_cli.plugins: Failed to load plugin '<name>': No module named
+'hermes_plugin_core'` in `~/.hermes/logs/errors.log`, and the plugin's tools
+silently vanish from the agent's schema (config still says `enabled`, the symlink
+is fine, `plugin.yaml` is fine — nothing looks wrong).
+
+Use the resolver, which probes for `hermes_cli` rather than trusting a path shape:
+
+```python
+from hermes_plugin_core.venv import hermes_venv_python, install_packages
+
+python = hermes_venv_python()          # override → in-process → newest managed → legacy
+install_packages(["requests"], python=python)
+```
+
+The rebuilt venv **has no pip** — `python -m pip` fails with "No module named pip".
+`install_packages`/`installer_command` use bundled uv with `--python <interpreter>`
+(without `--python`, uv installs into the wrong environment). `HERMES_PLUGIN_VENV_PYTHON`
+overrides resolution.
+
+The scaffolded `setup.sh` does the same probe in bash. If you hand-write one, never
+emit `~/.hermes/hermes-agent/venv/bin/python3`.
+
+Recovery when core itself is missing (chicken-and-egg — `setup.py` can't import it):
+
+```bash
+~/.hermes/bin/uv pip install --python \
+  "$(ls -td ~/.hermes/installs/*/environments/*/venv | head -1)/bin/python3" \
+  -e ~/Git_Repos/hermes-plugin-core
+```
+
+Then restart Hermes — tools register only at gateway startup, never hot-reload.
+
 ### Rule 8 — Use `hermes_plugin_core.config` for `config.yaml`
 
 Never manipulate `config.yaml` manually. Use `plugin_enable`, `plugin_disable`, `get_log_level`, `set_log_level` from `hermes_plugin_core.config`.
@@ -411,3 +452,43 @@ from hermes_plugin_core.config import (
 11. **Forgetting to restart Hermes after editing plugin code** — changes won't take effect.
 12. **Creating an extra skills symlink** — the plugin symlink is the only one needed.
 13. **`--yes` + all creds stored → EOFError in cmd_install** — `SetupCLI` handles this correctly; do not re-implement `cmd_install` unless you replicate the guard.
+14. **`--yes` is a GLOBAL flag, before the subcommand** — `./setup.sh --yes install`, not `./setup.sh install --yes` (the latter errors with `unrecognized arguments: --yes`).
+15. **`try/except ImportError` around `from . import schemas, tools` masks the real failure.** A missing third-party dep inside `tools.py` raises `ModuleNotFoundError` (an `ImportError` subclass), so the fallback `import schemas, tools` runs and reports `No module named 'schemas'` — pointing at the wrong file entirely. To see the true error, load the plugin as a package with `submodule_search_locations` set, or read the chained traceback.
+16. **`hermes plugins doctor` copies the plugin to a temp dir**, which breaks plugins that resolve sibling packages relative to `__file__`. A doctor failure there can be a false alarm — confirm against the live session (`tool_search` for one of its tools) before chasing it.
+17. **`security add-generic-password -w` with no argument prompts interactively and ignores stdin** — piping a value into it stores an *empty* password while still exiting 0. Use `-X <hex>` (`value.encode().hex()`); `-w <value>` works but puts plaintext in argv where `ps` can read it.
+
+## Diagnosing "my plugin's tools are missing"
+
+Order that finds it fastest:
+
+1. `grep -i "failed to load plugin" ~/.hermes/logs/errors.log` — the loader records the real import error; the agent just sees absent tools.
+2. `hermes plugins doctor <name>` — reports registration count (`26 tool(s)`) or the import error. Mind pitfall 16.
+3. Confirm the venv: `python -c "import hermes_plugin_core"` under `$(ls -td ~/.hermes/installs/*/environments/*/venv | head -1)/bin/python3`. If that fails, it's Rule 7b.
+4. Only then look at `config.yaml`, symlinks, and `plugin.yaml` — these are rarely the cause and look correct even when everything is broken.
+
+Tools register **only at gateway startup**. After any fix, restart Hermes and re-verify; a restart kills running agents, so confirm with the user first.
+
+**Read logs with timestamps, and test the live thing before reporting state.** A block of errors from two hours ago says nothing about now — call the plugin's ping tool and compare `date` against the newest log line. Reporting a stale window as current sends you fixing what is already fixed.
+
+## Rotating credentials: verify the write, not just the API call
+
+A plugin that refreshes OAuth tokens must confirm the new token actually
+persisted. macOS Keychain items can reach a state where they read fine but
+can be neither updated nor deleted, failing with `errSecInvalidOwnerEdit`
+(`-25244`); writes to a *new* account in the same service still succeed, so
+the service looks healthy.
+
+If the rotation path only logs the failure, every refreshed token is discarded
+and the stored one stays frozen at its original issuance — API calls keep
+working until the provider's hard lifetime expires, then demand an interactive
+sign-in. It looks like "the token expires daily" rather than a write bug.
+
+`hermes_plugin_core.keychain.cred_set` now recovers from this automatically
+(delete + re-add via the `security` CLI, with readback verification). To check
+whether a stored credential is actually being refreshed, compare its
+modification date against recent successful calls:
+
+```bash
+security find-generic-password -s hermes-<plugin> -a refresh_token | grep -E "cdat|mdat"
+# mdat frozen while calls succeed  ->  rotation is being silently dropped
+```
